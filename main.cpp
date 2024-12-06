@@ -1,109 +1,158 @@
-# Balancing Robot
+#include "mbed.h"          // Core Mbed OS functionality
+#include "Motor.h"         // Motor control library
+#include "AnalogIn.h"      // Analog input library (if needed)
+#include "ICM20948.h"      // IMU (Inertial Measurement Unit) library
+#include "uLCD.hpp"        // uLCD display library
+#include <chrono>          // Chrono library for time-related functions
+#include <cmath>           // Math library for mathematical functions
+#include <cstdlib>         // C standard library for general utilities
 
-A PID-controlled robot that stays upright with visual and audible feedback using Mbed OS.
+using namespace std::chrono_literals; // Enable chrono literals (e.g., 10ms)
 
-## Features
+// Pi constant
+constexpr float PI = 3.14159265358979323846f;
 
-- **Balance Control**: Keeps the robot balanced using a PID controller based on IMU data.
-- **Visual Feedback**: Shows a happy face on a uLCD when balanced and a sad face when tilted.
-- **Audible Alerts**: Plays sounds through a speaker when the robot tilts beyond a set threshold.
+// Initialize peripherals and components
+ICM20948 imu(p28, p27);     // IMU on pins p28 (SDA) and p27 (SCL)
+Motor m1(p23, p6, p5);      // Motor 1 with enable, forward, and reverse pins
+Motor m2(p26, p7, p8);      // Motor 2 with enable, forward, and reverse pins
+uLCD display(p9, p10, p11, uLCD::BAUD_9600); // uLCD display on specified pins
+Thread lcdThread;           // Thread for LCD display updates
+PwmOut speaker(p21);        // PWM output for speaker on pin p21
 
-## Hardware Requirements
+// PID Control Parameters
+float Kp = 2.75f;           // Proportional gain
+float Ki = 0.0f;            // Integral gain
+float Kd = 0.1f;            // Derivative gain
 
-- **Microcontroller**: Compatible with Mbed OS 6.16.0
-- **IMU Sensor**: ICM20948
-- **Motors**: 2 DC motors with motor drivers
-- **Display**: uLCD from MbedLibraryCollection
-- **Speaker**: Connected to a PWM pin (p21)
-- **Miscellaneous**: Jumper wires, breadboard, power supply
+float targetAz = -0.10f;    // Target azimuth angle for balance
+float prevError = 0.0f;     // Previous error for derivative calculation
+float integral = 0.0f;      // Integral sum for PID control
 
-## Software Requirements
+volatile float current_error = 0.0f; // Current error shared across threads
+const float dt = 0.01f; // PID loop interval (10ms)
 
-- **Mbed OS**: 6.16.0 (upgrade to 6.17.0 if possible)
-- **Mbed CLI**: For building and managing the project
-- **Compiler**: ARM Compiler 6 (ARMC6) recommended
-- **Serial Terminal**: For debugging (e.g., PuTTY, Tera Term)
+EventQueue queue; // Event queue for managing callbacks
+Ticker controlTicker; // Ticker to schedule periodic PID updates
 
-## Libraries Used
+// LCD Display Function
+// Updates the display with a happy or sad face based on error magnitude
+// Emits sound via speaker if the robot is tilted (|error| >= 0.6)
+void lcd_face() {
+    printf("LCD thread started\n"); // Debug message for thread initialization
+    display.cls(); // Clear the display
+    speaker.period(1.0f / 500.0f); // Set speaker frequency to 500Hz
 
-- **ICM20948 by Eric Leal**  
-  Interfaces with the ICM20948 IMU sensor.  
-  [GitHub Link](http://os.mbed.com/users/ericleal/code/ICM20948/)
+    bool last_face_happy = false; // Tracks previous face state
+    bool first_draw = true;       // Ensures the first face is always drawn
 
-- **Motor by Simon**  
-  Controls DC motors.  
-  [GitHub Link](http://os.mbed.com/users/simon/code/Motor/)
+    while (true) {
+        bool face_happy = (fabs(current_error) < 0.6f); // Determine face state
 
-- **uLCD from MbedLibraryCollection by Daniel Bailey**  
-  Manages the uLCD display functionalities.  
-  [GitHub Link](https://github.com/danielcbailey/MbedLibraryCollection.git)
-
-- **Mbed OS by ARM**  
-  Core operating system for the project.  
-  [GitHub Link](https://github.com/ARMmbed/mbed-os/)  
-  *(Using commit `54e8693ef4ff7e025018094f290a1d5cf380941f` on version 6.16.0)*
-
-## Setup
-
-1. **Clone the Repository**
-    ```bash
-    git clone https://github.com/yourusername/balancing-robot.git
-    cd balancing-robot
-    ```
-
-2. **Import Libraries**
-    ```bash
-    mbed add https://github.com/ericleal/ICM20948.git
-    mbed add https://github.com/simon/Motor.git
-    mbed add https://github.com/danielcbailey/MbedLibraryCollection.git
-    ```
-
-3. **Configure `mbed_app.json`**
-    Ensure `mbed_app.json` is set to enable floating-point printing:
-    ```json
-    {
-        "config": {
-            "print_float": {
-                "value": 1
-            }
-        },
-        "target_overrides": {
-            "*": {
-                "platform.stdio-convert-newlines": true,
-                "platform.stdio-baud-rate": 9600
-            }
+        // Manage speaker based on tilt state
+        if (face_happy) {
+            speaker = 0; // No sound for upright state
+            printf("no noise\n");
+        } else {
+            speaker = 0.5f; // Emit sound for tilted state
+            printf("noise\n");
         }
+
+        // Update the face only if the state has changed or it's the first draw
+        if (first_draw || (face_happy != last_face_happy)) {
+            printf("Face state changed: %s\n", face_happy ? "Happy" : "Sad");
+            display.cls(); // Clear display before drawing new face
+
+            int centerX = 64; // Face center X-coordinate
+            int centerY = 64; // Face center Y-coordinate
+            int radius = 30;  // Face radius
+
+            display.drawCircleFilled(centerX, centerY, radius, 0xFFFF); // Draw head
+            display.drawCircleFilled(centerX - 10, centerY + 12, 3, 0x0000); // Left eye
+            display.drawCircleFilled(centerX + 10, centerY + 12, 3, 0x0000); // Right eye
+
+            // Draw appropriate mouth
+            if (face_happy) {
+                // Draw smile (downward arc)
+                for (int angle = 180; angle <= 360; angle += 15) {
+                    float rad1 = angle * PI / 180.0f;
+                    float rad2 = (angle + 15) * PI / 180.0f;
+                    int x1 = centerX + 20 * cos(rad1);
+                    int y1 = centerY + 10 * sin(rad1);
+                    int x2 = centerX + 20 * cos(rad2);
+                    int y2 = centerY + 10 * sin(rad2);
+                    display.drawLine(x1, y1, x2, y2, 0x0000);
+                }
+            } else {
+                // Draw frown (upward arc)
+                for (int angle = 0; angle <= 180; angle += 15) {
+                    float rad1 = angle * PI / 180.0f;
+                    float rad2 = (angle + 15) * PI / 180.0f;
+                    int x1 = centerX + 20 * cos(rad1);
+                    int y1 = centerY + 10 * sin(rad1) - 15;
+                    int x2 = centerX + 20 * cos(rad2);
+                    int y2 = centerY + 10 * sin(rad2) - 15;
+                    display.drawLine(x1, y1, x2, y2, 0x0000);
+                }
+            }
+
+            last_face_happy = face_happy; // Update last face state
+            first_draw = false;          // Mark that the first draw is done
+        }
+
+        // Display current error on the uLCD
+        display.locate(0, 0);
+        display.printf("Error: %.2f  ", current_error);
+
+        ThisThread::sleep_for(200ms); // Update rate to reduce flicker
     }
-    ```
+}
 
-4. **Build and Flash**
-    Replace `YOUR_TARGET` with your specific board (e.g., `NUCLEO_F411RE`):
-    ```bash
-    mbed compile -m YOUR_TARGET -t GCC_ARM --flash
-    ```
+// PID Control Function
+// Reads IMU data, calculates PID output, and adjusts motor speeds
+void updateControl() {
+    imu.getAccGyro(); // Read accelerometer and gyroscope data
+    float az = imu.getAZ(); // Get current azimuth angle
 
-## Usage
+    float error = az - targetAz; // Calculate error
+    integral += error * dt;     // Update integral term
+    float derivative = (error - prevError); // Calculate derivative term
+    prevError = error;          // Store current error for next iteration
 
-1. **Connect Hardware**
-    - **IMU**: Pins `p28` (SDA) and `p27` (SCL)
-    - **Motor 1**: Pins `p23`, `p6`, `p5`
-    - **Motor 2**: Pins `p26`, `p7`, `p8`
-    - **uLCD**: Pins `p9` (TX), `p10` (RX), `p11` (RESET)
-    - **Speaker**: Pin `p21`
+    current_error = error;      // Update shared error variable
 
-2. **Monitor Serial Output**
-    Open your serial terminal at 9600 baud to see debug messages and PID outputs.
+    float pidOutput = (Kp * error) + (Ki * integral) + (Kd * derivative); // PID output
 
-3. **Operate the Robot**
-    Power on the robot. It should balance itself, display faces on the uLCD, and emit sounds when tilted.
+    if (pidOutput > 1.0f) pidOutput = 1.0f;
+    if (pidOutput < -1.0f) pidOutput = -1.0f;
 
-## Tips
+    if (fabs(error) > 0.85f) { // Stop motors if tilt exceeds threshold
+        m1.speed(0);
+        m2.speed(0);
+    } else {
+        m1.speed(-pidOutput); // Adjust motor speeds based on PID output
+        m2.speed(-pidOutput);
+    }
 
-- **ICM20948 Setup**: Ensure secure connections to pins `p28` and `p27` to get accurate IMU readings.
-- **Testing Motors**: Verify motor functionality with simple scripts before running the PID loop.
-- **uLCD Compatibility**: Double-check that your uLCD model is supported by the library from MbedLibraryCollection.
-- **PID Tuning**: Adjust `Kp`, `Ki`, and `Kd` in the code to fine-tune the balancing performance.
+    printf("az=%.2f, error=%.2f, pidOutput=%.2f\n", az, error, pidOutput); // Debug output
+}
 
-## License
+// Event Queue Callback
+// Enqueues the PID control function into the event queue
+void postUpdateControl() {
+    queue.call(updateControl);
+}
 
-MIT License
+int main() {
+    printf("1: Initializing IMU\n");
+    imu.init((1 | (1 << 1) | (0 << 3)), 1, (1 | (1 << 1) | (0 << 3)), 1); // Initialize IMU
+    printf("2: IMU Initialized\n");
+
+    controlTicker.attach(&postUpdateControl, 10ms); // Schedule PID updates
+    printf("3: Control Loop Started\n");
+
+    lcdThread.start(lcd_face); // Start LCD thread
+    printf("4: LCD Thread Started\n");
+
+    queue.dispatch_forever(); // Process events indefinitely
+}
