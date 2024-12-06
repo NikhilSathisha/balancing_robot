@@ -38,8 +38,7 @@ A PID-controlled robot that stays upright with visual and audible feedback using
 
 - **Mbed OS by ARM**  
   Core operating system for the project.  
-  [GitHub Link](https://github.com/ARMmbed/mbed-os/)  
-  *(Using commit `54e8693ef4ff7e025018094f290a1d5cf380941f` on version 6.16.0)*
+  [GitHub Link](https://github.com/ARMmbed/mbed-os/)
 
 ## Setup
 
