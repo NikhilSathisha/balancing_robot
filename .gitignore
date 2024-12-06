@@ -1,0 +1,12 @@
+.build
+.mbed
+projectfiles
+*.py*
+BUILD
+compile_commands.json
+.clangd
+.cache
+mbed-os
+ICM20948
+Motor
+mbedlibrarycollection
